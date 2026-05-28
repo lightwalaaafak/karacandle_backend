@@ -1,3 +1,5 @@
+// backend/src/server.js  ← UPDATED: added /api/categories route
+
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -9,6 +11,7 @@ import { fileURLToPath } from "url";
 
 import authRoutes from "./routes/auth.js";
 import productRoutes from "./routes/products.js";
+import categoryRoutes from "./routes/categories.js"; // ← NEW
 import collectionRoutes from "./routes/collections.js";
 import cartRoutes from "./routes/cart.js";
 import wishlistRoutes from "./routes/wishlist.js";
@@ -23,6 +26,7 @@ dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
+
 const allowedOrigins = [
   "https://thekaracandle.com",
   "https://www.thekaracandle.com",
@@ -33,26 +37,18 @@ const allowedOrigins = [
 
 app.set("trust proxy", 1);
 app.use(helmet({ crossOriginResourcePolicy: false }));
-
 app.use(
   cors({
     origin: (origin, callback) => {
-      // allow Postman/curl
       if (!origin) return callback(null, true);
-
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-
+      if (allowedOrigins.includes(origin)) return callback(null, true);
       return callback(new Error("CORS blocked: " + origin));
     },
-
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
-
 app.options("*", cors());
 app.use(express.json({ limit: "5mb" }));
 app.use(morgan("tiny"));
@@ -71,6 +67,7 @@ app.get("/api/health", (_, res) =>
 
 app.use("/api/auth", authRoutes);
 app.use("/api/products", productRoutes);
+app.use("/api/categories", categoryRoutes); // ← NEW
 app.use("/api/collections", collectionRoutes);
 app.use("/api/cart", cartRoutes);
 app.use("/api/wishlist", wishlistRoutes);
@@ -83,10 +80,7 @@ app.use("/api/admin", adminRoutes);
 
 app.use((err, req, res, next) => {
   console.error("API ERROR:", err);
-
-  res.status(err.status || 500).json({
-    error: err.message || "Server error",
-  });
+  res.status(err.status || 500).json({ error: err.message || "Server error" });
 });
 
 const PORT = process.env.PORT || 5000;
