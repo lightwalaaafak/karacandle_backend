@@ -54,12 +54,12 @@ app.use(express.json({ limit: "5mb" }));
 app.use(morgan("tiny"));
 app.use("/api/", rateLimit({ windowMs: 60_000, max: 200 }));
 
-app.use(
-  "/uploads",
-  express.static(
-    path.join(__dirname, "..", process.env.UPLOAD_DIR || "uploads"),
-  ),
-);
+// Replace the current static middleware with:
+const uploadsPath = process.env.UPLOAD_DIR
+  ? path.resolve(process.env.UPLOAD_DIR)
+  : path.join(__dirname, "..", "uploads");
+
+app.use("/uploads", express.static(uploadsPath));
 
 app.get("/api/health", (_, res) =>
   res.json({ ok: true, name: "Kara Candle API" }),
