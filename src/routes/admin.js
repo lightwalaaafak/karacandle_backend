@@ -28,6 +28,25 @@ r.get("/users", async (_, res) => {
   res.json(rows);
 });
 
+r.get("/users/stats", async (_, res) => {
+  const [[total]] = await db.query("SELECT COUNT(*) count FROM users");
+  const [[ordered]] = await db.query(
+    "SELECT COUNT(DISTINCT user_id) count FROM orders WHERE user_id IS NOT NULL",
+  );
+  const [[lastWeek]] = await db.query(
+    "SELECT COUNT(*) count FROM users WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)",
+  );
+  const [[lastMonth]] = await db.query(
+    "SELECT COUNT(*) count FROM users WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)",
+  );
+  res.json({
+    total: total.count,
+    ordered: ordered.count,
+    lastWeek: lastWeek.count,
+    lastMonth: lastMonth.count,
+  });
+});
+
 r.get("/orders", async (_, res) => {
   try {
     const [rows] = await db.query(
