@@ -21,6 +21,8 @@ import reviewRoutes from "./routes/reviews.js";
 import couponRoutes from "./routes/coupons.js";
 import cmsRoutes from "./routes/cms.js";
 import adminRoutes from "./routes/admin.js";
+import customOrdersRouter from "./routes/custom-orders.js";
+import offersRouter from "./routes/offers.js";
 
 dotenv.config();
 
@@ -77,6 +79,8 @@ app.use("/api/reviews", reviewRoutes);
 app.use("/api/coupons", couponRoutes);
 app.use("/api/cms", cmsRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/custom-orders", customOrdersRouter);
+app.use("/api/offers", offersRouter);
 
 app.use((err, req, res, next) => {
   console.error("API ERROR:", err);
