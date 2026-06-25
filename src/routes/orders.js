@@ -1,6 +1,8 @@
+// backend/src/routes/orders.js
 import { Router } from "express";
 import { db } from "../config/db.js";
 import { auth, adminOnly } from "../middleware/auth.js";
+
 const r = Router();
 
 const genOrderNumber = () =>
@@ -16,7 +18,6 @@ r.post("/", auth(false), async (req, res) => {
     billing_address,
     coupon_code,
     payment_provider = "razorpay",
-    // guest fields — used when no user is logged in
     guest_name,
     guest_email,
     guest_phone,
@@ -24,13 +25,12 @@ r.post("/", auth(false), async (req, res) => {
 
   if (!items?.length) return res.status(400).json({ error: "No items" });
 
-  // For guests, require name + email from body
   const orderEmail = req.user?.email || guest_email;
   const orderName = req.user?.name || guest_name;
   if (!orderEmail) return res.status(400).json({ error: "Email is required" });
   if (!orderName) return res.status(400).json({ error: "Name is required" });
 
-  // recompute server-side
+  // Recompute server-side
   const ids = items.map((i) => i.product_id);
   const [products] = await db.query(
     `SELECT id, name, price, discount_price, stock,
@@ -92,6 +92,7 @@ r.post("/", auth(false), async (req, res) => {
   );
 
   const orderId = result.insertId;
+
   for (const li of lineItems) {
     await db.query(
       `INSERT INTO order_items
@@ -107,6 +108,36 @@ r.post("/", auth(false), async (req, res) => {
         li.subtotal,
       ],
     );
+  }
+
+  // ── Track coupon usage ───────────────────────────────────────────────────
+  if (coupon_code && discount > 0) {
+    await db.query(
+      `UPDATE coupons SET used_count = used_count + 1 WHERE code = ?`,
+      [coupon_code],
+    );
+    await db.query(
+      `INSERT INTO order_coupons (order_id, coupon_code, discount_amount) VALUES (?,?,?)
+       ON DUPLICATE KEY UPDATE discount_amount = VALUES(discount_amount)`,
+      [orderId, coupon_code, discount],
+    );
+  }
+
+  // ── Track offer usage per order item ────────────────────────────────────
+  for (const item of items) {
+    const [[offer]] = await db.query(
+      `SELECT o.id FROM offers o
+       WHERE o.is_active=1 AND o.starts_at<=NOW() AND o.ends_at>=NOW()
+         AND (o.product_id IS NULL OR o.product_id=?)
+       ORDER BY o.product_id DESC LIMIT 1`,
+      [item.product_id],
+    );
+    if (offer) {
+      await db.query(
+        `UPDATE offers SET used_count = COALESCE(used_count, 0) + 1 WHERE id = ?`,
+        [offer.id],
+      );
+    }
   }
 
   // Clear DB cart if logged in
@@ -144,7 +175,6 @@ r.get("/track", async (req, res) => {
 
 // ── Single order ─────────────────────────────────────────────────────────────
 r.get("/:id", auth(false), async (req, res) => {
-  // logged-in: own orders or admin; guest: no access by ID (use /track instead)
   if (!req.user)
     return res
       .status(401)
@@ -168,7 +198,7 @@ r.get("/", auth(), adminOnly, async (_, res) => {
   res.json(rows);
 });
 
-// ── Admin: update status ─────────────────────────────────────────────────────
+// ── Admin: update status / tracking ─────────────────────────────────────────
 r.put("/:id/status", auth(), adminOnly, async (req, res) => {
   await db.query("UPDATE orders SET status=?, tracking_number=? WHERE id=?", [
     req.body.status,

@@ -1,10 +1,4 @@
-// backend/src/routes/products.js  ← UPDATED
-// Key fixes:
-//  • GET /:id/images  now resolves by numeric id (admin uses id, not slug)
-//  • category_name included in list + detail
-//  • DELETE /:productId/images/:imageId  promotes next primary on delete
-//  • PUT /:productId/images/:imageId/primary  to reorder
-
+// backend/src/routes/products.js
 import { Router } from "express";
 import { db } from "../config/db.js";
 import { auth, adminOnly } from "../middleware/auth.js";
@@ -60,7 +54,19 @@ r.get("/", async (req, res) => {
           (SELECT url FROM product_images
            WHERE product_id = p.id
            ORDER BY is_primary DESC, display_order
-           LIMIT 1) AS image_url
+           LIMIT 1) AS image_url,
+          (SELECT o.title FROM offers o
+           WHERE o.is_active=1 AND o.starts_at<=NOW() AND o.ends_at>=NOW()
+             AND (o.product_id IS NULL OR o.product_id=p.id)
+           ORDER BY o.product_id DESC LIMIT 1) AS offer_title,
+          (SELECT o.discount_pct FROM offers o
+           WHERE o.is_active=1 AND o.starts_at<=NOW() AND o.ends_at>=NOW()
+             AND (o.product_id IS NULL OR o.product_id=p.id)
+           ORDER BY o.product_id DESC LIMIT 1) AS offer_discount_pct,
+          (SELECT o.discount_amt FROM offers o
+           WHERE o.is_active=1 AND o.starts_at<=NOW() AND o.ends_at>=NOW()
+             AND (o.product_id IS NULL OR o.product_id=p.id)
+           ORDER BY o.product_id DESC LIMIT 1) AS offer_discount_amt
        FROM products p
        LEFT JOIN collections c   ON c.id = p.collection_id
        LEFT JOIN categories  cat ON cat.id = p.category_id
@@ -83,7 +89,19 @@ r.get("/:slug([a-z0-9-]+)", async (req, res) => {
           c.name   AS collection_name,
           c.slug   AS collection_slug,
           cat.name AS category_name,
-          cat.slug AS category_slug
+          cat.slug AS category_slug,
+          (SELECT o.title FROM offers o
+           WHERE o.is_active=1 AND o.starts_at<=NOW() AND o.ends_at>=NOW()
+             AND (o.product_id IS NULL OR o.product_id=p.id)
+           ORDER BY o.product_id DESC LIMIT 1) AS offer_title,
+          (SELECT o.discount_pct FROM offers o
+           WHERE o.is_active=1 AND o.starts_at<=NOW() AND o.ends_at>=NOW()
+             AND (o.product_id IS NULL OR o.product_id=p.id)
+           ORDER BY o.product_id DESC LIMIT 1) AS offer_discount_pct,
+          (SELECT o.discount_amt FROM offers o
+           WHERE o.is_active=1 AND o.starts_at<=NOW() AND o.ends_at>=NOW()
+             AND (o.product_id IS NULL OR o.product_id=p.id)
+           ORDER BY o.product_id DESC LIMIT 1) AS offer_discount_amt
        FROM products p
        LEFT JOIN collections c   ON c.id = p.collection_id
        LEFT JOIN categories  cat ON cat.id = p.category_id
@@ -119,7 +137,6 @@ r.get("/:slug([a-z0-9-]+)", async (req, res) => {
 });
 
 // ── Admin: get images by numeric product id ───────────────────────────────────
-// NOTE: must come BEFORE /:slug to avoid conflict — uses numeric-only pattern
 r.get("/:id(\\d+)/images", auth(), adminOnly, async (req, res) => {
   try {
     const [images] = await db.query(
@@ -286,7 +303,6 @@ r.delete("/:productId/images/:imageId", auth(), adminOnly, async (req, res) => {
 
     await db.query("DELETE FROM product_images WHERE id=?", [imageId]);
 
-    // Promote next image as primary if we just deleted the primary
     if (img.is_primary) {
       await db.query(
         "UPDATE product_images SET is_primary=1 WHERE product_id=? ORDER BY display_order LIMIT 1",
