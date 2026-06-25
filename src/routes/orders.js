@@ -41,15 +41,58 @@ r.post("/", auth(false), async (req, res) => {
   const map = new Map(products.map((p) => [p.id, p]));
 
   let subtotal = 0;
-  const lineItems = items.map((i) => {
+  const lineItems = [];
+
+  for (const i of items) {
     const p = map.get(i.product_id);
     if (!p) throw new Error("Invalid product");
-    const unit = Number(p.discount_price || p.price);
-    const sub = unit * i.quantity;
-    subtotal += sub;
-    return { ...p, quantity: i.quantity, unit_price: unit, subtotal: sub };
-  });
 
+    const basePrice = Number(p.discount_price || p.price);
+
+    // ── Apply active offer discount per item ────────────────────────────────
+    const [[activeOffer]] = await db.query(
+      `SELECT * FROM offers
+       WHERE is_active=1 AND starts_at<=NOW() AND ends_at>=NOW()
+         AND (product_id IS NULL OR product_id=?)
+       ORDER BY product_id DESC LIMIT 1`,
+      [i.product_id],
+    );
+
+    let unit_price = basePrice;
+    let item_offer_discount = 0;
+
+    if (activeOffer) {
+      let discounted = basePrice;
+      if (activeOffer.discount_pct) {
+        discounted =
+          basePrice - (basePrice * Number(activeOffer.discount_pct)) / 100;
+      } else if (activeOffer.discount_amt) {
+        discounted = Math.max(0, basePrice - Number(activeOffer.discount_amt));
+      }
+      item_offer_discount = (basePrice - discounted) * i.quantity;
+      unit_price = discounted;
+    }
+
+    const sub = unit_price * i.quantity;
+    subtotal += sub;
+
+    lineItems.push({
+      ...p,
+      quantity: i.quantity,
+      unit_price,
+      subtotal: sub,
+      offer_id: activeOffer?.id || null,
+      item_offer_discount,
+    });
+  }
+
+  // Total offer discount across all line items
+  const offer_discount = lineItems.reduce(
+    (s, li) => s + li.item_offer_discount,
+    0,
+  );
+
+  // ── Coupon discount (applied on post-offer subtotal) ────────────────────
   let discount = 0;
   if (coupon_code) {
     const [[c]] = await db.query(
@@ -71,9 +114,9 @@ r.post("/", auth(false), async (req, res) => {
 
   const [result] = await db.query(
     `INSERT INTO orders
-       (order_number, user_id, email, name, phone, subtotal, discount, shipping, total,
+       (order_number, user_id, email, name, phone, subtotal, offer_discount, discount, shipping, total,
         coupon_code, payment_provider, shipping_address, billing_address)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       order_number,
       req.user?.id || null,
@@ -81,6 +124,7 @@ r.post("/", auth(false), async (req, res) => {
       orderName,
       req.user?.phone || guest_phone || null,
       subtotal,
+      offer_discount,
       discount,
       shipping,
       total,
@@ -124,18 +168,11 @@ r.post("/", auth(false), async (req, res) => {
   }
 
   // ── Track offer usage per order item ────────────────────────────────────
-  for (const item of items) {
-    const [[offer]] = await db.query(
-      `SELECT o.id FROM offers o
-       WHERE o.is_active=1 AND o.starts_at<=NOW() AND o.ends_at>=NOW()
-         AND (o.product_id IS NULL OR o.product_id=?)
-       ORDER BY o.product_id DESC LIMIT 1`,
-      [item.product_id],
-    );
-    if (offer) {
+  for (const li of lineItems) {
+    if (li.offer_id) {
       await db.query(
         `UPDATE offers SET used_count = COALESCE(used_count, 0) + 1 WHERE id = ?`,
-        [offer.id],
+        [li.offer_id],
       );
     }
   }
