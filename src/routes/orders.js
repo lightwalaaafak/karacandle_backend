@@ -1,4 +1,3 @@
-// backend/src/routes/orders.js
 import { Router } from "express";
 import { db } from "../config/db.js";
 import { auth, adminOnly } from "../middleware/auth.js";
@@ -30,13 +29,14 @@ r.post("/", auth(false), async (req, res) => {
     const orderName = req.user?.name || guest_name;
     if (!orderEmail)
       return res.status(400).json({ error: "Email is required" });
-    if (!orderName) return res.status(400).json({ error: "Name is required" }); // Recompute server-side
+    if (!orderName) return res.status(400).json({ error: "Name is required" });
 
+    // ── Fetch products server-side ───────────────────────────────────────────
     const ids = items.map((i) => i.product_id);
     const [products] = await db.query(
       `SELECT id, name, price, discount_price, stock,
-       (SELECT url FROM product_images WHERE product_id=products.id LIMIT 1) AS image_url
-       FROM products WHERE id IN (?)`,
+       (SELECT url FROM product_images WHERE product_id=products.id LIMIT 1) AS image_url
+       FROM products WHERE id IN (?)`,
       [ids],
     );
     const map = new Map(products.map((p) => [p.id, p]));
@@ -52,15 +52,22 @@ r.post("/", auth(false), async (req, res) => {
           .json({ error: `Invalid product_id: ${i.product_id}` });
       }
 
-      const basePrice = Number(p.discount_price || p.price); // ── Apply active offer discount per item ────────────────────────────
+      const basePrice = Number(p.discount_price || p.price);
 
-      const [[activeOffer]] = await db.query(
-        `SELECT * FROM offers
-         WHERE is_active=1 AND starts_at<=NOW() AND ends_at>=NOW()
-           AND (product_id IS NULL OR product_id=?)
-         ORDER BY product_id DESC LIMIT 1`,
-        [i.product_id],
-      );
+      // ── Apply active offer discount per item ─────────────────────────────
+      let activeOffer = null;
+      try {
+        const [[found]] = await db.query(
+          `SELECT * FROM offers
+           WHERE is_active=1 AND starts_at<=NOW() AND ends_at>=NOW()
+             AND (product_id IS NULL OR product_id=?)
+           ORDER BY product_id DESC LIMIT 1`,
+          [i.product_id],
+        );
+        activeOffer = found || null;
+      } catch (e) {
+        console.warn("Offer lookup failed (non-fatal):", e.message);
+      }
 
       let unit_price = basePrice;
       let item_offer_discount = 0;
@@ -91,26 +98,32 @@ r.post("/", auth(false), async (req, res) => {
         offer_id: activeOffer?.id || null,
         item_offer_discount,
       });
-    } // Total offer discount across all line items
+    }
 
+    // ── Total offer discount ─────────────────────────────────────────────────
     const offer_discount = lineItems.reduce(
       (s, li) => s + li.item_offer_discount,
       0,
-    ); // ── Coupon discount (applied on post-offer subtotal) ────────────────────
+    );
 
+    // ── Coupon discount (applied on post-offer subtotal) ─────────────────────
     let discount = 0;
     if (coupon_code) {
-      const [[c]] = await db.query(
-        "SELECT * FROM coupons WHERE code=? AND is_active=1",
-        [coupon_code],
-      );
-      if (c && subtotal >= Number(c.min_order)) {
-        discount =
-          c.type === "percent"
-            ? (subtotal * Number(c.value)) / 100
-            : Number(c.value);
-        if (c.max_discount)
-          discount = Math.min(discount, Number(c.max_discount));
+      try {
+        const [[c]] = await db.query(
+          "SELECT * FROM coupons WHERE code=? AND is_active=1",
+          [coupon_code],
+        );
+        if (c && subtotal >= Number(c.min_order)) {
+          discount =
+            c.type === "percent"
+              ? (subtotal * Number(c.value)) / 100
+              : Number(c.value);
+          if (c.max_discount)
+            discount = Math.min(discount, Number(c.max_discount));
+        }
+      } catch (e) {
+        console.warn("Coupon lookup failed (non-fatal):", e.message);
       }
     }
 
@@ -118,11 +131,13 @@ r.post("/", auth(false), async (req, res) => {
     const total = subtotal - discount + shipping;
     const order_number = genOrderNumber();
 
+    // ── Insert order ─────────────────────────────────────────────────────────
     const [result] = await db.query(
       `INSERT INTO orders
-         (order_number, user_id, email, name, phone, subtotal, offer_discount, discount, shipping, total,
-          coupon_code, payment_provider, shipping_address, billing_address)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         (order_number, user_id, email, name, phone,
+          subtotal, offer_discount, discount, shipping, total,
+          coupon_code, payment_provider, shipping_address, billing_address)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         order_number,
         req.user?.id || null,
@@ -143,11 +158,12 @@ r.post("/", auth(false), async (req, res) => {
 
     const orderId = result.insertId;
 
+    // ── Insert order items ───────────────────────────────────────────────────
     for (const li of lineItems) {
       await db.query(
         `INSERT INTO order_items
-           (order_id, product_id, product_name, product_image, unit_price, quantity, subtotal)
-         VALUES (?,?,?,?,?,?,?)`,
+           (order_id, product_id, product_name, product_image, unit_price, quantity, subtotal)
+         VALUES (?,?,?,?,?,?,?)`,
         [
           orderId,
           li.id,
@@ -158,31 +174,50 @@ r.post("/", auth(false), async (req, res) => {
           li.subtotal,
         ],
       );
-    } // ── Track coupon usage ───────────────────────────────────────────────────
+    }
 
+    // ── Track coupon usage (non-fatal) ───────────────────────────────────────
     if (coupon_code && discount > 0) {
-      await db.query(
-        `UPDATE coupons SET used_count = used_count + 1 WHERE code = ?`,
-        [coupon_code],
-      );
-      await db.query(
-        `INSERT INTO order_coupons (order_id, coupon_code, discount_amount) VALUES (?,?,?)
-         ON DUPLICATE KEY UPDATE discount_amount = VALUES(discount_amount)`,
-        [orderId, coupon_code, discount],
-      );
-    } // ── Track offer usage per order item ────────────────────────────────────
+      try {
+        await db.query(
+          `UPDATE coupons SET used_count = COALESCE(used_count, 0) + 1 WHERE code = ?`,
+          [coupon_code],
+        );
+      } catch (e) {
+        console.warn("Could not update coupon used_count:", e.message);
+      }
+      try {
+        await db.query(
+          `INSERT INTO order_coupons (order_id, coupon_code, discount_amount) VALUES (?,?,?)
+           ON DUPLICATE KEY UPDATE discount_amount = VALUES(discount_amount)`,
+          [orderId, coupon_code, discount],
+        );
+      } catch (e) {
+        console.warn("order_coupons insert failed (non-fatal):", e.message);
+      }
+    }
 
+    // ── Track offer usage (non-fatal) ────────────────────────────────────────
     for (const li of lineItems) {
       if (li.offer_id) {
-        await db.query(
-          `UPDATE offers SET used_count = COALESCE(used_count, 0) + 1 WHERE id = ?`,
-          [li.offer_id],
-        );
+        try {
+          await db.query(
+            `UPDATE offers SET used_count = COALESCE(used_count, 0) + 1 WHERE id = ?`,
+            [li.offer_id],
+          );
+        } catch (e) {
+          console.warn("Could not update offer used_count:", e.message);
+        }
       }
-    } // Clear DB cart if logged in
+    }
 
+    // ── Clear DB cart if logged in ───────────────────────────────────────────
     if (req.user?.id) {
-      await db.query("DELETE FROM cart WHERE user_id=?", [req.user.id]);
+      try {
+        await db.query("DELETE FROM cart WHERE user_id=?", [req.user.id]);
+      } catch (e) {
+        console.warn("Could not clear cart:", e.message);
+      }
     }
 
     res.json({ id: orderId, order_number, total, currency: "USD" });
