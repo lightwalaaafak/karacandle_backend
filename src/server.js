@@ -23,6 +23,7 @@ import cmsRoutes from "./routes/cms.js";
 import adminRoutes from "./routes/admin.js";
 import customOrdersRouter from "./routes/custom-orders.js";
 import offersRouter from "./routes/offers.js";
+import discoverySetRoutes from "./routes/discovery-sets.js";
 
 dotenv.config();
 
@@ -81,6 +82,7 @@ app.use("/api/cms", cmsRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/custom-orders", customOrdersRouter);
 app.use("/api/offers", offersRouter);
+app.use("/api/discovery-sets", discoverySetRoutes);
 
 app.use((err, req, res, next) => {
   console.error("API ERROR:", err);
