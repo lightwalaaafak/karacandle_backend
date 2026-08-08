@@ -31,30 +31,57 @@ r.post("/", auth(false), async (req, res) => {
       return res.status(400).json({ error: "Email is required" });
     if (!orderName) return res.status(400).json({ error: "Name is required" });
 
-    // ── Fetch products server-side ───────────────────────────────────────────
-    const ids = items.map((i) => i.product_id);
-    const [products] = await db.query(
-      `SELECT id, name, price, discount_price, stock,
-       (SELECT url FROM product_images WHERE product_id=products.id LIMIT 1) AS image_url
-       FROM products WHERE id IN (?)`,
-      [ids],
+    const productItems = items.filter(
+      (i) => (i.item_type || "product") === "product",
     );
-    const map = new Map(products.map((p) => [p.id, p]));
+    const setItems = items.filter((i) => i.item_type === "discovery_set");
+
+    // ── fetch products for direct product items ─────────────────────────────
+    const productMap = new Map();
+    if (productItems.length) {
+      const ids = productItems.map((i) => i.product_id);
+      const [products] = await db.query(
+        `SELECT id, name, price, discount_price, stock,
+         (SELECT url FROM product_images WHERE product_id=products.id LIMIT 1) AS image_url
+         FROM products WHERE id IN (?)`,
+        [ids],
+      );
+      products.forEach((p) => productMap.set(p.id, p));
+    }
+
+    // ── fetch discovery sets + their included products ───────────────────────
+    const setMap = new Map();
+    if (setItems.length) {
+      const setIds = setItems.map((i) => i.discovery_set_id);
+      const [sets] = await db.query(
+        `SELECT * FROM discovery_sets WHERE id IN (?)`,
+        [setIds],
+      );
+      for (const s of sets) {
+        const [contents] = await db.query(
+          `SELECT dsi.product_id, p.name AS product_name
+           FROM discovery_set_items dsi
+           JOIN products p ON p.id = dsi.product_id
+           WHERE dsi.discovery_set_id=?`,
+          [s.id],
+        );
+        s.contents = contents;
+        setMap.set(s.id, s);
+      }
+    }
 
     let subtotal = 0;
     const lineItems = [];
 
-    for (const i of items) {
-      const p = map.get(i.product_id);
-      if (!p) {
+    // ── regular products (with offer logic, unchanged) ───────────────────────
+    for (const i of productItems) {
+      const p = productMap.get(i.product_id);
+      if (!p)
         return res
           .status(400)
           .json({ error: `Invalid product_id: ${i.product_id}` });
-      }
 
       const basePrice = Number(p.discount_price || p.price);
-
-      // ── Apply active offer discount per item ─────────────────────────────
       let activeOffer = null;
       try {
         const [[found]] = await db.query(
@@ -71,7 +98,6 @@ r.post("/", auth(false), async (req, res) => {
 
       let unit_price = basePrice;
       let item_offer_discount = 0;
-
       if (activeOffer) {
         let discounted = basePrice;
         if (activeOffer.discount_pct) {
@@ -91,22 +117,57 @@ r.post("/", auth(false), async (req, res) => {
       subtotal += sub;
 
       lineItems.push({
-        ...p,
+        item_type: "product",
+        product_id: p.id,
+        discovery_set_id: null,
+        name: p.name,
+        image_url: p.image_url,
         quantity: i.quantity,
         unit_price,
         subtotal: sub,
         offer_id: activeOffer?.id || null,
         item_offer_discount,
+        set_contents: null,
+        stock_deductions: [{ product_id: p.id, quantity: i.quantity }],
       });
     }
 
-    // ── Total offer discount ─────────────────────────────────────────────────
+    // ── discovery sets — flat price, no per-item offer, but stock deducts per candle ──
+    for (const i of setItems) {
+      const s = setMap.get(i.discovery_set_id);
+      if (!s)
+        return res
+          .status(400)
+          .json({ error: `Invalid discovery_set_id: ${i.discovery_set_id}` });
+
+      const unit_price = Number(s.price);
+      const sub = unit_price * i.quantity;
+      subtotal += sub;
+
+      lineItems.push({
+        item_type: "discovery_set",
+        product_id: null,
+        discovery_set_id: s.id,
+        name: s.name,
+        image_url: s.banner_image,
+        quantity: i.quantity,
+        unit_price,
+        subtotal: sub,
+        offer_id: null,
+        item_offer_discount: 0,
+        set_contents: s.contents,
+        stock_deductions: s.contents.map((c) => ({
+          product_id: c.product_id,
+          quantity: i.quantity, // 1 unit of each candle per set sold
+        })),
+      });
+    }
+
     const offer_discount = lineItems.reduce(
       (s, li) => s + li.item_offer_discount,
       0,
     );
 
-    // ── Coupon discount (applied on post-offer subtotal) ─────────────────────
     let discount = 0;
     if (coupon_code) {
       try {
@@ -131,7 +192,6 @@ r.post("/", auth(false), async (req, res) => {
     const total = subtotal - discount + shipping;
     const order_number = genOrderNumber();
 
-    // ── Insert order ─────────────────────────────────────────────────────────
     const [result] = await db.query(
       `INSERT INTO orders
          (order_number, user_id, email, name, phone,
@@ -155,18 +215,18 @@ r.post("/", auth(false), async (req, res) => {
         JSON.stringify(billing_address || shipping_address),
       ],
     );
-
     const orderId = result.insertId;
 
-    // ── Insert order items ───────────────────────────────────────────────────
     for (const li of lineItems) {
-      await db.query(
+      const [itemResult] = await db.query(
         `INSERT INTO order_items
-           (order_id, product_id, product_name, product_image, unit_price, quantity, subtotal)
-         VALUES (?,?,?,?,?,?,?)`,
+           (order_id, product_id, item_type, discovery_set_id, product_name, product_image, unit_price, quantity, subtotal)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
         [
           orderId,
-          li.id,
+          li.product_id,
+          li.item_type,
+          li.discovery_set_id,
           li.name,
           li.image_url,
           li.unit_price,
@@ -174,9 +234,19 @@ r.post("/", auth(false), async (req, res) => {
           li.subtotal,
         ],
       );
+
+      if (li.item_type === "discovery_set" && li.set_contents?.length) {
+        for (const c of li.set_contents) {
+          await db.query(
+            `INSERT INTO order_item_set_products (order_item_id, product_id, product_name, quantity)
+             VALUES (?,?,?,?)`,
+            [itemResult.insertId, c.product_id, c.product_name, li.quantity],
+          );
+        }
+      }
     }
 
-    // ── Track coupon usage (non-fatal) ───────────────────────────────────────
+    // ── coupon / offer usage tracking (unchanged) ─────────────────────────────
     if (coupon_code && discount > 0) {
       try {
         await db.query(
@@ -196,8 +266,6 @@ r.post("/", auth(false), async (req, res) => {
         console.warn("order_coupons insert failed (non-fatal):", e.message);
       }
     }
-
-    // ── Track offer usage (non-fatal) ────────────────────────────────────────
     for (const li of lineItems) {
       if (li.offer_id) {
         try {
@@ -211,7 +279,24 @@ r.post("/", auth(false), async (req, res) => {
       }
     }
 
-    // ── Clear DB cart if logged in ───────────────────────────────────────────
+    // ── stock deduction: every candle sold, whether solo or inside a set ────
+    const deductions = new Map(); // product_id -> total qty
+    for (const li of lineItems) {
+      for (const d of li.stock_deductions) {
+        deductions.set(
+          d.product_id,
+          (deductions.get(d.product_id) || 0) + d.quantity,
+        );
+      }
+    }
+    for (const [product_id, qty] of deductions) {
+      await db.query(
+        "UPDATE products SET stock = GREATEST(0, stock - ?) WHERE id=?",
+        [qty, product_id],
+      );
+    }
+
+    // ── clear DB cart (both product + set rows) if logged in ────────────────
     if (req.user?.id) {
       try {
         await db.query("DELETE FROM cart WHERE user_id=?", [req.user.id]);
@@ -283,6 +368,17 @@ r.get("/:id", auth(false), async (req, res) => {
       "SELECT * FROM order_items WHERE order_id=?",
       [order.id],
     );
+
+    for (const item of items) {
+      if (item.item_type === "discovery_set") {
+        const [setProducts] = await db.query(
+          "SELECT product_id, product_name, quantity FROM order_item_set_products WHERE order_item_id=?",
+          [item.id],
+        );
+        item.set_products = setProducts;
+      }
+    }
+
     res.json({ ...order, items });
   } catch (err) {
     console.error("Fetch order failed:", err);
