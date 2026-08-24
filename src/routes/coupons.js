@@ -1,9 +1,9 @@
 import { Router } from "express";
 import { db } from "../config/db.js";
 import { auth, adminOnly } from "../middleware/auth.js";
+import { emitEvent } from "../socket.js";
 const r = Router();
 
-// GET /coupons/validate?code=NEW10&order_total=340
 r.get("/validate", async (req, res) => {
   const { code, order_total } = req.query;
   if (!code) return res.status(400).json({ error: "Code is required" });
@@ -14,19 +14,16 @@ r.get("/validate", async (req, res) => {
   );
   if (!c) return res.status(404).json({ error: "Invalid coupon code" });
 
-  // Check min order
   if (c.min_order && Number(order_total) < Number(c.min_order)) {
     return res.status(400).json({
       error: `Minimum order of $${Number(c.min_order).toFixed(2)} required`,
     });
   }
 
-  // Check expiry
   if (c.expires_at && new Date(c.expires_at) < new Date()) {
     return res.status(400).json({ error: "This coupon has expired" });
   }
 
-  // Check usage limit
   if (c.usage_limit && c.used_count >= c.usage_limit) {
     return res.status(400).json({ error: "Coupon usage limit reached" });
   }
@@ -34,7 +31,6 @@ r.get("/validate", async (req, res) => {
   res.json(c);
 });
 
-// Keep POST /validate if needed elsewhere
 r.post("/validate", async (req, res) => {
   const [[c]] = await db.query(
     "SELECT * FROM coupons WHERE code=? AND is_active=1",
@@ -73,7 +69,14 @@ r.post("/", auth(), adminOnly, async (req, res) => {
       expires_at || null,
     ],
   );
+  emitEvent("coupon:created", { id: result.insertId, code });
   res.json({ id: result.insertId });
+});
+
+r.delete("/:id", auth(), adminOnly, async (req, res) => {
+  await db.query("DELETE FROM coupons WHERE id=?", [req.params.id]);
+  emitEvent("coupon:deleted", { id: Number(req.params.id) });
+  res.json({ ok: true });
 });
 
 export default r;

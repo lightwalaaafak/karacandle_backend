@@ -1,6 +1,7 @@
-// backend/src/server.js  ← UPDATED: added /api/categories route
+// backend/src/server.js
 
 import express from "express";
+import http from "http";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
@@ -11,7 +12,7 @@ import { fileURLToPath } from "url";
 
 import authRoutes from "./routes/auth.js";
 import productRoutes from "./routes/products.js";
-import categoryRoutes from "./routes/categories.js"; // ← NEW
+import categoryRoutes from "./routes/categories.js";
 import collectionRoutes from "./routes/collections.js";
 import cartRoutes from "./routes/cart.js";
 import wishlistRoutes from "./routes/wishlist.js";
@@ -24,6 +25,7 @@ import adminRoutes from "./routes/admin.js";
 import customOrdersRouter from "./routes/custom-orders.js";
 import offersRouter from "./routes/offers.js";
 import discoverySetRoutes from "./routes/discovery-sets.js";
+import { initSocket } from "./socket.js";
 
 dotenv.config();
 
@@ -57,7 +59,6 @@ app.use(express.json({ limit: "5mb" }));
 app.use(morgan("tiny"));
 app.use("/api/", rateLimit({ windowMs: 60_000, max: 200 }));
 
-// Replace the current static middleware with:
 const uploadsPath = process.env.UPLOAD_DIR
   ? path.resolve(process.env.UPLOAD_DIR)
   : path.join(__dirname, "..", "uploads");
@@ -70,7 +71,7 @@ app.get("/api/health", (_, res) =>
 
 app.use("/api/auth", authRoutes);
 app.use("/api/products", productRoutes);
-app.use("/api/categories", categoryRoutes); // ← NEW
+app.use("/api/categories", categoryRoutes);
 app.use("/api/collections", collectionRoutes);
 app.use("/api/cart", cartRoutes);
 app.use("/api/wishlist", wishlistRoutes);
@@ -90,4 +91,9 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Kara Candle API on :${PORT}`));
+
+// ── Wrap app in an HTTP server so Socket.IO can attach to the same port ─────
+const httpServer = http.createServer(app);
+initSocket(httpServer, allowedOrigins);
+
+httpServer.listen(PORT, () => console.log(`Kara Candle API on :${PORT}`));

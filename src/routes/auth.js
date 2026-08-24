@@ -2,6 +2,7 @@ import { Router } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { db } from "../config/db.js";
+import { emitEvent } from "../socket.js";
 
 const r = Router();
 
@@ -20,6 +21,14 @@ r.post("/register", async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN },
     );
+
+    emitEvent("user:new", {
+      id: result.insertId,
+      name,
+      email,
+      created_at: new Date().toISOString(),
+    });
+
     res.json({ token, user: { id: result.insertId, name, email } });
   } catch (e) {
     if (e.code === "ER_DUP_ENTRY")
@@ -78,8 +87,6 @@ r.post("/admin/register", async (req, res) => {
       .status(400)
       .json({ error: "Password must be at least 8 characters" });
 
-  // Only allow if no admins exist yet, OR require a superadmin invite token
-  // For now: restrict to a whitelist domain or a secret signup key
   const ADMIN_SIGNUP_SECRET = process.env.ADMIN_SIGNUP_SECRET;
   const { secret } = req.body;
   if (ADMIN_SIGNUP_SECRET && secret !== ADMIN_SIGNUP_SECRET)

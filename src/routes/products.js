@@ -3,6 +3,7 @@ import { Router } from "express";
 import { db } from "../config/db.js";
 import { auth, adminOnly } from "../middleware/auth.js";
 import { upload } from "../middleware/upload.js";
+import { emitEvent } from "../socket.js";
 
 const r = Router();
 
@@ -194,6 +195,14 @@ r.post("/", auth(), adminOnly, async (req, res) => {
         is_active !== undefined ? (is_active ? 1 : 0) : 1,
       ],
     );
+
+    emitEvent("product:created", {
+      id: result.insertId,
+      name,
+      price,
+      stock: stock || 0,
+    });
+
     res.json({ id: result.insertId });
   } catch (e) {
     if (e.code === "ER_DUP_ENTRY")
@@ -233,6 +242,7 @@ r.put("/:id", auth(), adminOnly, async (req, res) => {
   vals.push(req.params.id);
   try {
     await db.query(`UPDATE products SET ${set.join(",")} WHERE id=?`, vals);
+    emitEvent("product:updated", { id: Number(req.params.id) });
     res.json({ ok: true });
   } catch (e) {
     if (e.code === "ER_DUP_ENTRY")
@@ -248,6 +258,7 @@ r.delete("/:id", auth(), adminOnly, async (req, res) => {
     await db.query("UPDATE products SET is_active=0 WHERE id=?", [
       req.params.id,
     ]);
+    emitEvent("product:deleted", { id: Number(req.params.id) });
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: "Server error" });

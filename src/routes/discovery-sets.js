@@ -2,6 +2,7 @@ import { Router } from "express";
 import { db } from "../config/db.js";
 import { auth, adminOnly } from "../middleware/auth.js";
 import { upload } from "../middleware/upload.js";
+import { emitEvent } from "../socket.js";
 
 const r = Router();
 
@@ -145,6 +146,8 @@ r.post(
         );
       }
 
+      emitEvent("discovery_set:created", { id: setId, name });
+
       res.json({ id: setId });
     } catch (e) {
       if (e.code === "ER_DUP_ENTRY")
@@ -238,6 +241,8 @@ r.put(
         }
       }
 
+      emitEvent("discovery_set:updated", { id: Number(req.params.id) });
+
       res.json({ ok: true });
     } catch (e) {
       if (e.code === "ER_DUP_ENTRY")
@@ -252,6 +257,7 @@ r.put(
 r.delete("/:id", auth(), adminOnly, async (req, res) => {
   try {
     await db.query(`DELETE FROM discovery_sets WHERE id=?`, [req.params.id]);
+    emitEvent("discovery_set:deleted", { id: Number(req.params.id) });
     res.json({ ok: true });
   } catch (e) {
     console.error(e);

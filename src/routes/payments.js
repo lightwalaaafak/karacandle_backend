@@ -4,6 +4,7 @@ import Razorpay from "razorpay";
 import Stripe from "stripe";
 import { db } from "../config/db.js";
 import { auth } from "../middleware/auth.js";
+import { emitEvent } from "../socket.js";
 
 const r = Router();
 
@@ -18,7 +19,6 @@ const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
 
-// helper — find order for both guest and logged-in
 const findOrder = async (order_id, user) => {
   if (user?.isAdmin) {
     const [[o]] = await db.query("SELECT * FROM orders WHERE id=?", [order_id]);
@@ -31,7 +31,6 @@ const findOrder = async (order_id, user) => {
     );
     return o;
   }
-  // guest: match by id only (they just placed it in the same session)
   const [[o]] = await db.query("SELECT * FROM orders WHERE id=?", [order_id]);
   return o;
 };
@@ -62,10 +61,17 @@ r.post("/razorpay/verify", auth(false), async (req, res) => {
     .digest("hex");
   if (expected !== razorpay_signature)
     return res.status(400).json({ error: "Invalid signature" });
+
   await db.query(
     "UPDATE orders SET payment_status='paid', status='paid', payment_id=? WHERE id=?",
     [razorpay_payment_id, order_id],
   );
+
+  emitEvent("order:paid", {
+    id: Number(order_id),
+    payment_id: razorpay_payment_id,
+  });
+
   res.json({ ok: true });
 });
 

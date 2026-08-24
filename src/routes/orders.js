@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { db } from "../config/db.js";
 import { auth, adminOnly } from "../middleware/auth.js";
+import { emitEvent } from "../socket.js";
 
 const r = Router();
 
@@ -9,7 +10,6 @@ const genOrderNumber = () =>
   Date.now().toString(36).toUpperCase() +
   Math.random().toString(36).slice(2, 6).toUpperCase();
 
-// ── Create order — works for guests AND logged-in users ──────────────────────
 r.post("/", auth(false), async (req, res) => {
   try {
     const {
@@ -36,7 +36,6 @@ r.post("/", auth(false), async (req, res) => {
     );
     const setItems = items.filter((i) => i.item_type === "discovery_set");
 
-    // ── fetch products for direct product items ─────────────────────────────
     const productMap = new Map();
     if (productItems.length) {
       const ids = productItems.map((i) => i.product_id);
@@ -49,7 +48,6 @@ r.post("/", auth(false), async (req, res) => {
       products.forEach((p) => productMap.set(p.id, p));
     }
 
-    // ── fetch discovery sets + their included products ───────────────────────
     const setMap = new Map();
     if (setItems.length) {
       const setIds = setItems.map((i) => i.discovery_set_id);
@@ -73,7 +71,6 @@ r.post("/", auth(false), async (req, res) => {
     let subtotal = 0;
     const lineItems = [];
 
-    // ── regular products (with offer logic, unchanged) ───────────────────────
     for (const i of productItems) {
       const p = productMap.get(i.product_id);
       if (!p)
@@ -132,7 +129,6 @@ r.post("/", auth(false), async (req, res) => {
       });
     }
 
-    // ── discovery sets — flat price, no per-item offer, but stock deducts per candle ──
     for (const i of setItems) {
       const s = setMap.get(i.discovery_set_id);
       if (!s)
@@ -158,7 +154,7 @@ r.post("/", auth(false), async (req, res) => {
         set_contents: s.contents,
         stock_deductions: s.contents.map((c) => ({
           product_id: c.product_id,
-          quantity: i.quantity, // 1 unit of each candle per set sold
+          quantity: i.quantity,
         })),
       });
     }
@@ -246,7 +242,6 @@ r.post("/", auth(false), async (req, res) => {
       }
     }
 
-    // ── coupon / offer usage tracking (unchanged) ─────────────────────────────
     if (coupon_code && discount > 0) {
       try {
         await db.query(
@@ -279,8 +274,7 @@ r.post("/", auth(false), async (req, res) => {
       }
     }
 
-    // ── stock deduction: every candle sold, whether solo or inside a set ────
-    const deductions = new Map(); // product_id -> total qty
+    const deductions = new Map();
     for (const li of lineItems) {
       for (const d of li.stock_deductions) {
         deductions.set(
@@ -294,9 +288,9 @@ r.post("/", auth(false), async (req, res) => {
         "UPDATE products SET stock = GREATEST(0, stock - ?) WHERE id=?",
         [qty, product_id],
       );
+      emitEvent("product:stock_updated", { product_id, deducted: qty });
     }
 
-    // ── clear DB cart (both product + set rows) if logged in ────────────────
     if (req.user?.id) {
       try {
         await db.query("DELETE FROM cart WHERE user_id=?", [req.user.id]);
@@ -305,6 +299,19 @@ r.post("/", auth(false), async (req, res) => {
       }
     }
 
+    // ── Notify admin dashboard/orders page in realtime ────────────────────────
+    emitEvent("order:new", {
+      id: orderId,
+      order_number,
+      total,
+      subtotal,
+      name: orderName,
+      email: orderEmail,
+      payment_status: "pending",
+      status: "pending",
+      created_at: new Date().toISOString(),
+    });
+
     res.json({ id: orderId, order_number, total, currency: "USD" });
   } catch (err) {
     console.error("Order creation failed:", err);
@@ -312,7 +319,6 @@ r.post("/", auth(false), async (req, res) => {
   }
 });
 
-// ── My orders — logged-in users only ────────────────────────────────────────
 r.get("/me", auth(), async (req, res) => {
   try {
     const [rows] = await db.query(
@@ -326,7 +332,6 @@ r.get("/me", auth(), async (req, res) => {
   }
 });
 
-// ── Guest order lookup by order_number + email ───────────────────────────────
 r.get("/track", async (req, res) => {
   try {
     const { order_number, email } = req.query;
@@ -350,7 +355,6 @@ r.get("/track", async (req, res) => {
   }
 });
 
-// ── Single order ─────────────────────────────────────────────────────────────
 r.get("/:id", auth(false), async (req, res) => {
   try {
     if (!req.user)
@@ -386,7 +390,6 @@ r.get("/:id", auth(false), async (req, res) => {
   }
 });
 
-// ── Admin: list all ──────────────────────────────────────────────────────────
 r.get("/", auth(), adminOnly, async (_, res) => {
   try {
     const [rows] = await db.query(
@@ -399,7 +402,6 @@ r.get("/", auth(), adminOnly, async (_, res) => {
   }
 });
 
-// ── Admin: update status / tracking ─────────────────────────────────────────
 r.put("/:id/status", auth(), adminOnly, async (req, res) => {
   try {
     await db.query("UPDATE orders SET status=?, tracking_number=? WHERE id=?", [
@@ -407,6 +409,13 @@ r.put("/:id/status", auth(), adminOnly, async (req, res) => {
       req.body.tracking_number || null,
       req.params.id,
     ]);
+
+    emitEvent("order:updated", {
+      id: Number(req.params.id),
+      status: req.body.status,
+      tracking_number: req.body.tracking_number || null,
+    });
+
     res.json({ ok: true });
   } catch (err) {
     console.error("Update order status failed:", err);

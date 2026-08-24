@@ -1,10 +1,10 @@
 import { Router } from "express";
 import { db } from "../config/db.js";
 import { auth, adminOnly } from "../middleware/auth.js";
+import { emitEvent } from "../socket.js";
 
 const r = Router();
 
-// Public — active offers (for strip + shop badges)
 r.get("/active", async (_, res) => {
   try {
     const [rows] = await db.query(
@@ -24,7 +24,6 @@ r.get("/active", async (_, res) => {
   }
 });
 
-// Admin — list all
 r.get("/", auth(), adminOnly, async (_, res) => {
   try {
     const [rows] = await db.query(
@@ -39,7 +38,6 @@ r.get("/", auth(), adminOnly, async (_, res) => {
   }
 });
 
-// Admin — create
 r.post("/", auth(), adminOnly, async (req, res) => {
   const {
     title,
@@ -72,6 +70,7 @@ r.post("/", auth(), adminOnly, async (req, res) => {
         is_active ?? 1,
       ],
     );
+    emitEvent("offer:created", { id: result.insertId, title });
     res.json({ id: result.insertId });
   } catch (e) {
     console.error(e);
@@ -79,7 +78,6 @@ r.post("/", auth(), adminOnly, async (req, res) => {
   }
 });
 
-// Admin — update
 r.put("/:id", auth(), adminOnly, async (req, res) => {
   const fields = [
     "title",
@@ -104,16 +102,17 @@ r.put("/:id", auth(), adminOnly, async (req, res) => {
   vals.push(req.params.id);
   try {
     await db.query(`UPDATE offers SET ${set.join(",")} WHERE id=?`, vals);
+    emitEvent("offer:updated", { id: Number(req.params.id) });
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// Admin — delete
 r.delete("/:id", auth(), adminOnly, async (req, res) => {
   try {
     await db.query("DELETE FROM offers WHERE id=?", [req.params.id]);
+    emitEvent("offer:deleted", { id: Number(req.params.id) });
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: "Server error" });
