@@ -7,27 +7,27 @@ const r = Router();
 r.get("/", auth(false), async (req, res) => {
   if (!req.user) return res.json([]);
   try {
-    // ── product cart rows ──────────────────────────────────────────────────
+    // ── Regular product rows ──────────────────────────────────────────────
     const [productRows] = await db.query(
-      `SELECT 
+      `SELECT
         c.id, c.quantity, 'product' AS item_type,
         p.id AS product_id, NULL AS discovery_set_id,
         p.name, p.slug, p.price, p.discount_price, p.stock, p.burn_time,
         col.name AS collection_name,
         (SELECT url FROM product_images WHERE product_id=p.id LIMIT 1) AS image_url,
-        (SELECT o.id FROM offers o 
+        (SELECT o.id FROM offers o
          WHERE o.is_active=1 AND o.starts_at<=NOW() AND o.ends_at>=NOW()
            AND (o.product_id IS NULL OR o.product_id=p.id)
          ORDER BY o.product_id DESC LIMIT 1) AS offer_id,
-        (SELECT o.title FROM offers o 
+        (SELECT o.title FROM offers o
          WHERE o.is_active=1 AND o.starts_at<=NOW() AND o.ends_at>=NOW()
            AND (o.product_id IS NULL OR o.product_id=p.id)
          ORDER BY o.product_id DESC LIMIT 1) AS offer_title,
-        (SELECT o.discount_pct FROM offers o 
+        (SELECT o.discount_pct FROM offers o
          WHERE o.is_active=1 AND o.starts_at<=NOW() AND o.ends_at>=NOW()
            AND (o.product_id IS NULL OR o.product_id=p.id)
          ORDER BY o.product_id DESC LIMIT 1) AS offer_discount_pct,
-        (SELECT o.discount_amt FROM offers o 
+        (SELECT o.discount_amt FROM offers o
          WHERE o.is_active=1 AND o.starts_at<=NOW() AND o.ends_at>=NOW()
            AND (o.product_id IS NULL OR o.product_id=p.id)
          ORDER BY o.product_id DESC LIMIT 1) AS offer_discount_amt
@@ -41,12 +41,11 @@ r.get("/", auth(false), async (req, res) => {
     const enrichedProducts = productRows.map((item) => {
       const basePrice = Number(item.discount_price || item.price);
       let offerPrice = null;
-      if (item.offer_discount_pct) {
+      if (item.offer_discount_pct)
         offerPrice =
           basePrice - (basePrice * Number(item.offer_discount_pct)) / 100;
-      } else if (item.offer_discount_amt) {
+      else if (item.offer_discount_amt)
         offerPrice = Math.max(0, basePrice - Number(item.offer_discount_amt));
-      }
       return {
         ...item,
         effective_price: offerPrice ?? basePrice,
@@ -54,14 +53,15 @@ r.get("/", auth(false), async (req, res) => {
       };
     });
 
-    // ── discovery-set cart rows ──────────────────────────────────────────────
+    // ── Discovery set rows ────────────────────────────────────────────────
     const [setRows] = await db.query(
       `SELECT c.id, c.quantity, 'discovery_set' AS item_type,
         NULL AS product_id, ds.id AS discovery_set_id,
         ds.name, ds.slug, ds.price, NULL AS discount_price, NULL AS stock, NULL AS burn_time,
         'Discovery Set' AS collection_name,
         ds.banner_image AS image_url,
-        NULL AS offer_id, NULL AS offer_title, NULL AS offer_discount_pct, NULL AS offer_discount_amt,
+        NULL AS offer_id, NULL AS offer_title,
+        NULL AS offer_discount_pct, NULL AS offer_discount_amt,
         ds.price AS effective_price, 0 AS offer_saving
        FROM cart c
        JOIN discovery_sets ds ON ds.id = c.discovery_set_id
@@ -69,7 +69,6 @@ r.get("/", auth(false), async (req, res) => {
       [req.user.id],
     );
 
-    // attach included product names for display in the cart line
     for (const s of setRows) {
       const [items] = await db.query(
         `SELECT p.name FROM discovery_set_items dsi
@@ -80,7 +79,69 @@ r.get("/", auth(false), async (req, res) => {
       s.included_products = items.map((i) => i.name);
     }
 
-    res.json([...enrichedProducts, ...setRows]);
+    // ── Custom pack rows ──────────────────────────────────────────────────
+    const [packRows] = await db.query(
+      `SELECT c.id, c.quantity, 'custom_pack' AS item_type,
+        NULL AS product_id, NULL AS discovery_set_id,
+        c.pack_size, c.pack_price, c.pack_selections,
+        NULL AS offer_id, NULL AS offer_title,
+        NULL AS offer_discount_pct, NULL AS offer_discount_amt,
+        0 AS offer_saving
+       FROM cart c
+       WHERE c.user_id=? AND c.item_type='custom_pack'`,
+      [req.user.id],
+    );
+
+    const enrichedPacks = await Promise.all(
+      packRows.map(async (pack) => {
+        let selections = [];
+        try {
+          selections =
+            typeof pack.pack_selections === "string"
+              ? JSON.parse(pack.pack_selections)
+              : pack.pack_selections || [];
+        } catch {
+          selections = [];
+        }
+
+        // Enrich with current product names and images
+        const enrichedSelections = await Promise.all(
+          selections.map(async (s) => {
+            try {
+              const [[p]] = await db.query(
+                `SELECT name, slug,
+                   (SELECT url FROM product_images WHERE product_id=? LIMIT 1) AS image_url
+                 FROM products WHERE id=?`,
+                [s.product_id, s.product_id],
+              );
+              return {
+                ...s,
+                name: p?.name || "Candle",
+                image_url: p?.image_url || null,
+              };
+            } catch {
+              return { ...s, name: "Candle", image_url: null };
+            }
+          }),
+        );
+
+        return {
+          ...pack,
+          name: `${pack.pack_size} Candle Pack`,
+          slug: "discovery-sets",
+          price: Number(pack.pack_price),
+          effective_price: Number(pack.pack_price),
+          image_url: null,
+          collection_name: "Build Your Own Pack",
+          pack_selections: enrichedSelections,
+          included_products: enrichedSelections.map(
+            (s) => `${s.name} ×${s.quantity}`,
+          ),
+        };
+      }),
+    );
+
+    res.json([...enrichedProducts, ...setRows, ...enrichedPacks]);
   } catch (e) {
     console.error("Cart GET failed:", e);
     res.status(500).json({ error: "Could not load cart" });

@@ -35,7 +35,9 @@ r.post("/", auth(false), async (req, res) => {
       (i) => (i.item_type || "product") === "product",
     );
     const setItems = items.filter((i) => i.item_type === "discovery_set");
+    const customPackItems = items.filter((i) => i.item_type === "custom_pack");
 
+    // ── Fetch products ────────────────────────────────────────────────────
     const productMap = new Map();
     if (productItems.length) {
       const ids = productItems.map((i) => i.product_id);
@@ -48,11 +50,12 @@ r.post("/", auth(false), async (req, res) => {
       products.forEach((p) => productMap.set(p.id, p));
     }
 
+    // ── Fetch discovery sets ──────────────────────────────────────────────
     const setMap = new Map();
     if (setItems.length) {
       const setIds = setItems.map((i) => i.discovery_set_id);
       const [sets] = await db.query(
-        `SELECT * FROM discovery_sets WHERE id IN (?)`,
+        "SELECT * FROM discovery_sets WHERE id IN (?)",
         [setIds],
       );
       for (const s of sets) {
@@ -71,6 +74,7 @@ r.post("/", auth(false), async (req, res) => {
     let subtotal = 0;
     const lineItems = [];
 
+    // ── Regular products ──────────────────────────────────────────────────
     for (const i of productItems) {
       const p = productMap.get(i.product_id);
       if (!p)
@@ -90,29 +94,27 @@ r.post("/", auth(false), async (req, res) => {
         );
         activeOffer = found || null;
       } catch (e) {
-        console.warn("Offer lookup failed (non-fatal):", e.message);
+        console.warn("Offer lookup failed:", e.message);
       }
 
-      let unit_price = basePrice;
-      let item_offer_discount = 0;
+      let unit_price = basePrice,
+        item_offer_discount = 0;
       if (activeOffer) {
         let discounted = basePrice;
-        if (activeOffer.discount_pct) {
+        if (activeOffer.discount_pct)
           discounted =
             basePrice - (basePrice * Number(activeOffer.discount_pct)) / 100;
-        } else if (activeOffer.discount_amt) {
+        else if (activeOffer.discount_amt)
           discounted = Math.max(
             0,
             basePrice - Number(activeOffer.discount_amt),
           );
-        }
         item_offer_discount = (basePrice - discounted) * i.quantity;
         unit_price = discounted;
       }
 
       const sub = unit_price * i.quantity;
       subtotal += sub;
-
       lineItems.push({
         item_type: "product",
         product_id: p.id,
@@ -125,10 +127,12 @@ r.post("/", auth(false), async (req, res) => {
         offer_id: activeOffer?.id || null,
         item_offer_discount,
         set_contents: null,
+        pack_data: null,
         stock_deductions: [{ product_id: p.id, quantity: i.quantity }],
       });
     }
 
+    // ── Discovery sets ────────────────────────────────────────────────────
     for (const i of setItems) {
       const s = setMap.get(i.discovery_set_id);
       if (!s)
@@ -139,7 +143,6 @@ r.post("/", auth(false), async (req, res) => {
       const unit_price = Number(s.price);
       const sub = unit_price * i.quantity;
       subtotal += sub;
-
       lineItems.push({
         item_type: "discovery_set",
         product_id: null,
@@ -152,6 +155,7 @@ r.post("/", auth(false), async (req, res) => {
         offer_id: null,
         item_offer_discount: 0,
         set_contents: s.contents,
+        pack_data: null,
         stock_deductions: s.contents.map((c) => ({
           product_id: c.product_id,
           quantity: i.quantity,
@@ -159,11 +163,98 @@ r.post("/", auth(false), async (req, res) => {
       });
     }
 
+    // ── Custom packs — validate and price from DB ─────────────────────────
+    for (const i of customPackItems) {
+      const { pack_size, selections } = i;
+      if (!pack_size || !Array.isArray(selections) || selections.length === 0)
+        return res.status(400).json({ error: "Invalid custom pack data" });
+
+      const totalQty = selections.reduce(
+        (s, sel) => s + Number(sel.quantity),
+        0,
+      );
+      if (totalQty !== Number(pack_size))
+        return res
+          .status(400)
+          .json({
+            error: `Pack selections (${totalQty}) don't match pack size (${pack_size})`,
+          });
+
+      // Fetch trusted price
+      const [[packConfig]] = await db.query(
+        "SELECT price, is_active FROM discovery_pack_settings WHERE pack_size=?",
+        [Number(pack_size)],
+      );
+      if (!packConfig || !packConfig.is_active)
+        return res
+          .status(400)
+          .json({ error: `Pack size ${pack_size} is not available` });
+
+      // Validate stock
+      const agg = new Map();
+      for (const s of selections)
+        agg.set(
+          Number(s.product_id),
+          (agg.get(Number(s.product_id)) || 0) + Number(s.quantity),
+        );
+
+      const [products] = await db.query(
+        "SELECT id, name, stock, is_active FROM products WHERE id IN (?)",
+        [[...agg.keys()]],
+      );
+      const prodMap = new Map(products.map((p) => [p.id, p]));
+
+      const stockDeductions = [];
+      for (const [pid, qty] of agg) {
+        const p = prodMap.get(pid);
+        if (!p)
+          return res.status(400).json({ error: `Product ${pid} not found` });
+        if (!p.is_active)
+          return res.status(400).json({ error: `"${p.name}" is unavailable` });
+        if (p.stock < qty)
+          return res
+            .status(400)
+            .json({ error: `"${p.name}" only has ${p.stock} in stock` });
+        stockDeductions.push({ product_id: pid, quantity: qty });
+      }
+
+      const packPrice = Number(packConfig.price);
+      const packQty = Number(i.quantity) || 1;
+      const sub = packPrice * packQty;
+      subtotal += sub;
+
+      lineItems.push({
+        item_type: "custom_pack",
+        product_id: null,
+        discovery_set_id: null,
+        name: `${pack_size} Candle Pack`,
+        image_url: null,
+        quantity: packQty,
+        unit_price: packPrice,
+        subtotal: sub,
+        offer_id: null,
+        item_offer_discount: 0,
+        set_contents: null,
+        pack_data: {
+          pack_size: Number(pack_size),
+          pack_price: packPrice,
+          selections: [...agg].map(([pid, qty]) => ({
+            product_id: pid,
+            quantity: qty,
+            product_name: prodMap.get(pid)?.name || "",
+          })),
+        },
+        stock_deductions: stockDeductions,
+      });
+    }
+
+    // ── Offer discount total ──────────────────────────────────────────────
     const offer_discount = lineItems.reduce(
       (s, li) => s + li.item_offer_discount,
       0,
     );
 
+    // ── Coupon ────────────────────────────────────────────────────────────
     let discount = 0;
     if (coupon_code) {
       try {
@@ -180,7 +271,7 @@ r.post("/", auth(false), async (req, res) => {
             discount = Math.min(discount, Number(c.max_discount));
         }
       } catch (e) {
-        console.warn("Coupon lookup failed (non-fatal):", e.message);
+        console.warn("Coupon lookup failed:", e.message);
       }
     }
 
@@ -188,6 +279,7 @@ r.post("/", auth(false), async (req, res) => {
     const total = subtotal - discount + shipping;
     const order_number = genOrderNumber();
 
+    // ── Insert order ──────────────────────────────────────────────────────
     const [result] = await db.query(
       `INSERT INTO orders
          (order_number, user_id, email, name, phone,
@@ -213,6 +305,7 @@ r.post("/", auth(false), async (req, res) => {
     );
     const orderId = result.insertId;
 
+    // ── Insert order_items ────────────────────────────────────────────────
     for (const li of lineItems) {
       const [itemResult] = await db.query(
         `INSERT INTO order_items
@@ -231,6 +324,7 @@ r.post("/", auth(false), async (req, res) => {
         ],
       );
 
+      // Discovery set sub-products
       if (li.item_type === "discovery_set" && li.set_contents?.length) {
         for (const c of li.set_contents) {
           await db.query(
@@ -240,66 +334,90 @@ r.post("/", auth(false), async (req, res) => {
           );
         }
       }
-    }
 
-    if (coupon_code && discount > 0) {
-      try {
-        await db.query(
-          `UPDATE coupons SET used_count = COALESCE(used_count, 0) + 1 WHERE code = ?`,
-          [coupon_code],
+      // Custom pack snapshot
+      if (li.item_type === "custom_pack" && li.pack_data) {
+        const [packResult] = await db.query(
+          `INSERT INTO order_custom_packs (order_id, order_item_id, pack_size, pack_price)
+           VALUES (?,?,?,?)`,
+          [
+            orderId,
+            itemResult.insertId,
+            li.pack_data.pack_size,
+            li.pack_data.pack_price,
+          ],
         );
-      } catch (e) {
-        console.warn("Could not update coupon used_count:", e.message);
-      }
-      try {
-        await db.query(
-          `INSERT INTO order_coupons (order_id, coupon_code, discount_amount) VALUES (?,?,?)
-           ON DUPLICATE KEY UPDATE discount_amount = VALUES(discount_amount)`,
-          [orderId, coupon_code, discount],
-        );
-      } catch (e) {
-        console.warn("order_coupons insert failed (non-fatal):", e.message);
-      }
-    }
-    for (const li of lineItems) {
-      if (li.offer_id) {
-        try {
+        for (const s of li.pack_data.selections) {
           await db.query(
-            `UPDATE offers SET used_count = COALESCE(used_count, 0) + 1 WHERE id = ?`,
-            [li.offer_id],
+            `INSERT INTO order_custom_pack_selections (order_custom_pack_id, product_id, product_name, quantity)
+             VALUES (?,?,?,?)`,
+            [packResult.insertId, s.product_id, s.product_name, s.quantity],
           );
-        } catch (e) {
-          console.warn("Could not update offer used_count:", e.message);
         }
       }
     }
 
-    const deductions = new Map();
+    // ── Coupon tracking ───────────────────────────────────────────────────
+    if (coupon_code && discount > 0) {
+      try {
+        await db.query(
+          "UPDATE coupons SET used_count = COALESCE(used_count,0)+1 WHERE code=?",
+          [coupon_code],
+        );
+      } catch (e) {
+        console.warn("Coupon update failed:", e.message);
+      }
+      try {
+        await db.query(
+          `INSERT INTO order_coupons (order_id, coupon_code, discount_amount) VALUES (?,?,?)
+           ON DUPLICATE KEY UPDATE discount_amount=VALUES(discount_amount)`,
+          [orderId, coupon_code, discount],
+        );
+      } catch (e) {
+        console.warn("order_coupons insert failed:", e.message);
+      }
+    }
+
+    // ── Offer tracking ────────────────────────────────────────────────────
     for (const li of lineItems) {
-      for (const d of li.stock_deductions) {
+      if (li.offer_id) {
+        try {
+          await db.query(
+            "UPDATE offers SET used_count=COALESCE(used_count,0)+1 WHERE id=?",
+            [li.offer_id],
+          );
+        } catch (e) {
+          console.warn("Offer update failed:", e.message);
+        }
+      }
+    }
+
+    // ── Stock deductions ──────────────────────────────────────────────────
+    const deductions = new Map();
+    for (const li of lineItems)
+      for (const d of li.stock_deductions)
         deductions.set(
           d.product_id,
           (deductions.get(d.product_id) || 0) + d.quantity,
         );
-      }
-    }
+
     for (const [product_id, qty] of deductions) {
       await db.query(
-        "UPDATE products SET stock = GREATEST(0, stock - ?) WHERE id=?",
+        "UPDATE products SET stock=GREATEST(0, stock-?) WHERE id=?",
         [qty, product_id],
       );
       emitEvent("product:stock_updated", { product_id, deducted: qty });
     }
 
+    // ── Clear DB cart ─────────────────────────────────────────────────────
     if (req.user?.id) {
       try {
         await db.query("DELETE FROM cart WHERE user_id=?", [req.user.id]);
       } catch (e) {
-        console.warn("Could not clear cart:", e.message);
+        console.warn("Cart clear failed:", e.message);
       }
     }
 
-    // ── Notify admin dashboard/orders page in realtime ────────────────────────
     emitEvent("order:new", {
       id: orderId,
       order_number,
@@ -327,7 +445,6 @@ r.get("/me", auth(), async (req, res) => {
     );
     res.json(rows);
   } catch (err) {
-    console.error("Fetch my orders failed:", err);
     res.status(500).json({ error: "Could not fetch orders" });
   }
 });
@@ -337,20 +454,17 @@ r.get("/track", async (req, res) => {
     const { order_number, email } = req.query;
     if (!order_number || !email)
       return res.status(400).json({ error: "order_number and email required" });
-
     const [[order]] = await db.query(
       "SELECT * FROM orders WHERE order_number=? AND email=?",
       [order_number, email],
     );
     if (!order) return res.status(404).json({ error: "Order not found" });
-
     const [items] = await db.query(
       "SELECT * FROM order_items WHERE order_id=?",
       [order.id],
     );
     res.json({ ...order, items });
   } catch (err) {
-    console.error("Track order failed:", err);
     res.status(500).json({ error: "Could not track order" });
   }
 });
@@ -375,17 +489,29 @@ r.get("/:id", auth(false), async (req, res) => {
 
     for (const item of items) {
       if (item.item_type === "discovery_set") {
-        const [setProducts] = await db.query(
+        const [sp] = await db.query(
           "SELECT product_id, product_name, quantity FROM order_item_set_products WHERE order_item_id=?",
           [item.id],
         );
-        item.set_products = setProducts;
+        item.set_products = sp;
+      }
+      if (item.item_type === "custom_pack") {
+        const [[pack]] = await db.query(
+          "SELECT * FROM order_custom_packs WHERE order_item_id=?",
+          [item.id],
+        );
+        if (pack) {
+          const [sels] = await db.query(
+            "SELECT * FROM order_custom_pack_selections WHERE order_custom_pack_id=?",
+            [pack.id],
+          );
+          item.custom_pack = { ...pack, selections: sels };
+        }
       }
     }
 
     res.json({ ...order, items });
   } catch (err) {
-    console.error("Fetch order failed:", err);
     res.status(500).json({ error: "Could not fetch order" });
   }
 });
@@ -397,7 +523,6 @@ r.get("/", auth(), adminOnly, async (_, res) => {
     );
     res.json(rows);
   } catch (err) {
-    console.error("Fetch all orders failed:", err);
     res.status(500).json({ error: "Could not fetch orders" });
   }
 });
@@ -409,16 +534,13 @@ r.put("/:id/status", auth(), adminOnly, async (req, res) => {
       req.body.tracking_number || null,
       req.params.id,
     ]);
-
     emitEvent("order:updated", {
       id: Number(req.params.id),
       status: req.body.status,
       tracking_number: req.body.tracking_number || null,
     });
-
     res.json({ ok: true });
   } catch (err) {
-    console.error("Update order status failed:", err);
     res.status(500).json({ error: "Could not update order" });
   }
 });

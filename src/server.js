@@ -27,6 +27,7 @@ import customOrdersRouter from "./routes/custom-orders.js";
 import offersRouter from "./routes/offers.js";
 import discoverySetRoutes from "./routes/discovery-sets.js";
 import contactRoutes from "./routes/contact.js";
+import discoveryPackRoutes from "./routes/discovery-pack.js";
 
 import { initSocket } from "./socket.js";
 
@@ -150,6 +151,7 @@ app.use("/api/offers", offersRouter);
 
 app.use("/api/discovery-sets", discoverySetRoutes);
 
+app.use("/api/discovery-pack", discoveryPackRoutes); //new updated discovery pack route
 // --------------------------------------------------
 // CONTACT FORM
 // --------------------------------------------------
