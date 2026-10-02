@@ -3,14 +3,14 @@
 import { Router } from "express";
 import { db } from "../config/db.js";
 import { auth, adminOnly } from "../middleware/auth.js";
-
+import { upload } from "../middleware/upload.js";
 const r = Router();
 
 // ── Public: active pack configs ───────────────────────────────────────────
 r.get("/config", async (_, res) => {
   try {
     const [rows] = await db.query(
-      "SELECT id, pack_size, price FROM discovery_pack_settings WHERE is_active=1 ORDER BY pack_size ASC",
+      "SELECT id, pack_size, price, banner_image, description FROM discovery_pack_settings WHERE is_active=1 ORDER BY pack_size ASC",
     );
     res.json({ packs: rows });
   } catch (e) {
@@ -51,11 +51,9 @@ r.post("/cart", auth(false), async (req, res) => {
 
   for (const s of selections) {
     if (!s.product_id || !s.quantity || s.quantity <= 0)
-      return res
-        .status(400)
-        .json({
-          error: "Each selection needs product_id and positive quantity",
-        });
+      return res.status(400).json({
+        error: "Each selection needs product_id and positive quantity",
+      });
   }
 
   const totalQty = selections.reduce((sum, s) => sum + Number(s.quantity), 0);
@@ -186,32 +184,47 @@ r.post("/admin/config", auth(), adminOnly, async (req, res) => {
   }
 });
 
-// ── Admin: update pack config by id ──────────────────────────────────────
-r.put("/admin/config/:id", auth(), adminOnly, async (req, res) => {
-  const { price, is_active } = req.body;
-  if (price !== undefined && Number(price) <= 0)
-    return res.status(400).json({ error: "Price must be positive" });
-  try {
-    const fields = [],
-      vals = [];
-    if (price !== undefined) {
-      fields.push("price=?");
-      vals.push(Number(price));
+// In discovery-pack.js — replace the PUT /admin/config/:id route:
+r.put(
+  "/admin/config/:id",
+  auth(),
+  adminOnly,
+  upload.single("banner_image"),
+  async (req, res) => {
+    const { price, is_active, description } = req.body;
+    if (price !== undefined && Number(price) <= 0)
+      return res.status(400).json({ error: "Price must be positive" });
+    try {
+      const fields = [],
+        vals = [];
+      if (price !== undefined) {
+        fields.push("price=?");
+        vals.push(Number(price));
+      }
+      if (is_active !== undefined) {
+        fields.push("is_active=?");
+        vals.push(is_active ? 1 : 0);
+      }
+      if (description !== undefined) {
+        fields.push("description=?");
+        vals.push(description || null);
+      }
+      if (req.file) {
+        const base = process.env.PUBLIC_URL || "";
+        fields.push("banner_image=?");
+        vals.push(`${base}/uploads/${req.file.filename}`);
+      }
+      if (!fields.length) return res.json({ ok: true });
+      vals.push(req.params.id);
+      await db.query(
+        `UPDATE discovery_pack_settings SET ${fields.join(",")} WHERE id=?`,
+        vals,
+      );
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ error: "Could not update config" });
     }
-    if (is_active !== undefined) {
-      fields.push("is_active=?");
-      vals.push(is_active ? 1 : 0);
-    }
-    if (!fields.length) return res.json({ ok: true });
-    vals.push(req.params.id);
-    await db.query(
-      `UPDATE discovery_pack_settings SET ${fields.join(",")} WHERE id=?`,
-      vals,
-    );
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: "Could not update config" });
-  }
-});
+  },
+);
 
 export default r;
