@@ -43,7 +43,6 @@ r.get("/products", async (_, res) => {
 r.post("/cart", auth(false), async (req, res) => {
   const { pack_size, selections } = req.body;
 
-  // Shape validation
   if (!pack_size || !Array.isArray(selections) || selections.length === 0)
     return res.status(400).json({ error: "pack_size and selections required" });
   if (!Number.isInteger(Number(pack_size)) || Number(pack_size) <= 0)
@@ -66,23 +65,20 @@ r.post("/cart", auth(false), async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    // Fetch trusted pack price
     const [[packConfig]] = await conn.query(
       "SELECT price, is_active FROM discovery_pack_settings WHERE pack_size = ? FOR SHARE",
       [Number(pack_size)],
     );
-    if (!packConfig)
-      return conn
-        .rollback()
-        .then(() =>
-          res.status(400).json({ error: "This pack size is not available" }),
-        );
-    if (!packConfig.is_active)
-      return conn
-        .rollback()
-        .then(() =>
-          res.status(400).json({ error: "This pack is currently unavailable" }),
-        );
+    if (!packConfig) {
+      await conn.rollback();
+      return res.status(400).json({ error: "This pack size is not available" });
+    }
+    if (!packConfig.is_active) {
+      await conn.rollback();
+      return res
+        .status(400)
+        .json({ error: "This pack is currently unavailable" });
+    }
 
     // Aggregate selections (in case duplicates sent)
     const agg = new Map();
@@ -92,48 +88,54 @@ r.post("/cart", auth(false), async (req, res) => {
         (agg.get(Number(s.product_id)) || 0) + Number(s.quantity),
       );
 
-    // Validate products
+    // Validate products + fetch name / image / collection
     const productIds = [...agg.keys()];
     const [products] = await conn.query(
-      "SELECT id, name, stock, is_active FROM products WHERE id IN (?)",
+      `SELECT p.id, p.name, p.stock, p.is_active,
+         col.name AS collection_name,
+         (SELECT pi.url FROM product_images pi
+          WHERE pi.product_id = p.id ORDER BY pi.is_primary DESC LIMIT 1) AS image_url
+       FROM products p
+       LEFT JOIN collections col ON col.id = p.collection_id
+       WHERE p.id IN (?)`,
       [productIds],
     );
-    const prodMap = new Map(products.map((p) => [p.id, p]));
+    const prodMap = new Map(products.map((p) => [Number(p.id), p]));
 
     for (const [pid, qty] of agg) {
       const p = prodMap.get(pid);
-      if (!p)
-        return conn
-          .rollback()
-          .then(() =>
-            res.status(400).json({ error: `Product ID ${pid} not found` }),
-          );
-      if (!p.is_active)
-        return conn
-          .rollback()
-          .then(() =>
-            res.status(400).json({ error: `"${p.name}" is not available` }),
-          );
-      if (p.stock < qty)
-        return conn
-          .rollback()
-          .then(() =>
-            res
-              .status(400)
-              .json({ error: `"${p.name}" only has ${p.stock} in stock` }),
-          );
+      if (!p) {
+        await conn.rollback();
+        return res.status(400).json({ error: `Product ID ${pid} not found` });
+      }
+      if (!p.is_active) {
+        await conn.rollback();
+        return res.status(400).json({ error: `"${p.name}" is not available` });
+      }
+      if (p.stock < qty) {
+        await conn.rollback();
+        return res
+          .status(400)
+          .json({ error: `"${p.name}" only has ${p.stock} in stock` });
+      }
     }
 
-    // Build selections array
+    // Store name/image snapshot with each selection
     const selectionsToStore = [];
     for (const [pid, qty] of agg) {
-      selectionsToStore.push({ product_id: pid, quantity: qty });
+      const p = prodMap.get(pid);
+      selectionsToStore.push({
+        product_id: pid,
+        quantity: qty,
+        name: p.name,
+        image_url: p.image_url || null,
+        collection_name: p.collection_name || null,
+      });
     }
 
     const packPrice = Number(packConfig.price);
     const userId = req.user?.id || null;
 
-    // Insert into cart with item_type = 'custom_pack'
     const [result] = await conn.query(
       `INSERT INTO cart (user_id, item_type, pack_size, pack_price, pack_selections, quantity)
        VALUES (?, 'custom_pack', ?, ?, ?, 1)`,
@@ -184,7 +186,7 @@ r.post("/admin/config", auth(), adminOnly, async (req, res) => {
   }
 });
 
-// In discovery-pack.js — replace the PUT /admin/config/:id route:
+// ── Admin: update pack config (price, status, description, banner) ────────
 r.put(
   "/admin/config/:id",
   auth(),
@@ -203,7 +205,14 @@ r.put(
       }
       if (is_active !== undefined) {
         fields.push("is_active=?");
-        vals.push(is_active ? 1 : 0);
+        vals.push(
+          is_active === "0" ||
+            is_active === 0 ||
+            is_active === false ||
+            is_active === "false"
+            ? 0
+            : 1,
+        );
       }
       if (description !== undefined) {
         fields.push("description=?");
@@ -222,6 +231,7 @@ r.put(
       );
       res.json({ ok: true });
     } catch (e) {
+      console.error(e);
       res.status(500).json({ error: "Could not update config" });
     }
   },
